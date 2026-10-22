@@ -8,6 +8,17 @@ import { pool, initSchema } from "./db.js";
 const PORT = process.env.PORT || 3000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
 
+// Explicit request limits (MCP SDK GHSA-46jr-4wx8-v453): the SDK's tool-input
+// element cap is off by default and its own body cap is skipped when express
+// has already parsed the body, so both are set here.
+const MAX_BODY = "256kb";
+const MAX_BODY_BYTES = 256 * 1024;
+const MAX_TOOL_INPUT_ELEMENTS = 128;
+const MAX_MEMORY_CHARS = 32000;
+const MAX_TAGS = 20;
+const MAX_TAG_CHARS = 64;
+const MAX_QUERY_CHARS = 1000;
+
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
 
 async function userForToken(token) {
@@ -27,10 +38,13 @@ function formatMemory(row) {
 // ---------- MCP server (one instance per request, scoped to a user) ----------
 
 function buildMcpServer(user) {
-  const server = new McpServer({
-    name: "firmament-openbrain",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    {
+      name: "firmament-openbrain",
+      version: "1.0.0",
+    },
+    { maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS }
+  );
 
   server.registerTool(
     "remember",
@@ -39,9 +53,14 @@ function buildMcpServer(user) {
       description:
         "Store a memory in your Open Brain. Use this to save durable facts, preferences, decisions, project context, or anything worth recalling later. Write memories as self-contained statements.",
       inputSchema: {
-        content: z.string().min(1).describe("The memory to store, as a self-contained statement"),
+        content: z
+          .string()
+          .min(1)
+          .max(MAX_MEMORY_CHARS)
+          .describe("The memory to store, as a self-contained statement"),
         tags: z
-          .array(z.string())
+          .array(z.string().max(MAX_TAG_CHARS))
+          .max(MAX_TAGS)
           .optional()
           .describe("Optional short tags for grouping, e.g. ['deal-flow', 'preferences']"),
       },
@@ -64,7 +83,11 @@ function buildMcpServer(user) {
       description:
         "Search your Open Brain memories by topic or keywords. Returns the most relevant memories. Use this at the start of a task to pull in relevant context.",
       inputSchema: {
-        query: z.string().min(1).describe("What to search for, in plain words"),
+        query: z
+          .string()
+          .min(1)
+          .max(MAX_QUERY_CHARS)
+          .describe("What to search for, in plain words"),
         limit: z.number().int().min(1).max(50).optional().describe("Max results (default 8)"),
       },
     },
@@ -156,7 +179,7 @@ function buildMcpServer(user) {
 
 const app = express();
 app.set("trust proxy", true);
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: MAX_BODY }));
 
 app.get("/", (_req, res) => {
   res.type("text/plain").send(
@@ -187,7 +210,17 @@ app.post("/mcp/:token", async (req, res) => {
       });
     }
     const server = buildMcpServer(user);
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    if (Array.isArray(req.body) && req.body.length > 20) {
+      return res.status(413).json({
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "Batch too large" },
+        id: null,
+      });
+    }
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      maxRequestBodySize: MAX_BODY_BYTES,
+    });
     res.on("close", () => {
       transport.close();
       server.close();
